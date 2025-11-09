@@ -49,6 +49,7 @@ REQUEST_RETRIES = 3
 REQUEST_RETRY_DELAY_SECONDS = 2
 MIN_REQUEST_INTERVAL_SECONDS = 1
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 10
+MIN_PAGE_LIMIT = 5
 
 
 CHINESE_PATTERN = re.compile(
@@ -112,6 +113,8 @@ class MastodonChineseScraper:
 
         os.makedirs(self.output_dir, exist_ok=True)
         self._last_request_ts: float = 0.0
+        # Some instances reject the maximum limit=40; start with the configured value
+        # and reduce dynamically if we encounter 422 errors.
         self.page_limit: int = REQUEST_LIMIT_PER_CALL
 
     # -----------------------------
@@ -271,42 +274,26 @@ class MastodonChineseScraper:
 
             if response.status_code == 422:
                 # Some instances restrict the maximum allowed limit value.
-                limit_adjusted = False
                 try:
                     payload = response.json()
                 except ValueError:
-                    payload = None
+                    payload = {"error": response.text}
 
-                if (
-                    payload
-                    and isinstance(payload, dict)
-                    and "details" in payload
-                    and isinstance(payload["details"], dict)
-                ):
-                    detail_str = json.dumps(payload["details"])
-                else:
-                    detail_str = str(payload)
+                detail_str = json.dumps(payload, ensure_ascii=False)
 
-                if (
-                    detail_str
-                    and "limit" in detail_str.lower()
-                    and self.page_limit > 20
-                ):
-                    self.page_limit = 20
+                if self.page_limit > MIN_PAGE_LIMIT:
+                    self.page_limit = max(self.page_limit // 2, MIN_PAGE_LIMIT)
+                    params["limit"] = self.page_limit
                     print(
-                        "Received 422 indicating the page limit is too high. "
-                        "Reducing per-request limit to 20 and retrying..."
+                        "Received 422 response, likely due to request limits. "
+                        f"Reducing per-request limit to {self.page_limit} and retrying..."
                     )
                     time.sleep(MIN_REQUEST_INTERVAL_SECONDS)
-                    limit_adjusted = True
-
-                if limit_adjusted:
-                    params["limit"] = self.page_limit
                     continue
 
                 raise RuntimeError(
-                    "Received 422 Unprocessable Entity response. "
-                    "Please check instance capabilities or adjust parameters."
+                    "Received 422 Unprocessable Entity response even with minimal "
+                    f"page size ({self.page_limit}). Details: {detail_str}"
                 )
 
             # For other status codes, raise the error immediately.
