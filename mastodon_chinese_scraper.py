@@ -27,6 +27,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from requests import RequestException
+from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout
 from bs4 import BeautifulSoup
 
 
@@ -234,7 +236,18 @@ class MastodonChineseScraper:
 
         for attempt in range(REQUEST_RETRIES):
             self._respect_rate_limit()
-            response = self.session.get(url, params=params, timeout=30)
+            try:
+                response = self.session.get(url, params=params, timeout=30)
+            except (Timeout, RequestsConnectionError) as exc:
+                print(
+                    f"Network timeout/connection error on attempt {attempt + 1} "
+                    f"of {REQUEST_RETRIES}: {exc}. Retrying in "
+                    f"{REQUEST_RETRY_DELAY_SECONDS}s..."
+                )
+                time.sleep(REQUEST_RETRY_DELAY_SECONDS)
+                continue
+            except RequestException as exc:
+                raise RuntimeError(f"Request failed due to an unexpected error: {exc}") from exc
 
             if response.status_code == 200:
                 self._update_rate_limit_state(response.headers)
