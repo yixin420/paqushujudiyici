@@ -112,6 +112,7 @@ class MastodonChineseScraper:
 
         os.makedirs(self.output_dir, exist_ok=True)
         self._last_request_ts: float = 0.0
+        self.page_limit: int = REQUEST_LIMIT_PER_CALL
 
     # -----------------------------
     # Public entry points
@@ -224,7 +225,7 @@ class MastodonChineseScraper:
     ) -> List[dict]:
         """Fetch a single page from the public timeline with retries and rate limiting."""
         url = f"{self.base_url}/api/v1/timelines/public"
-        params = {"limit": REQUEST_LIMIT_PER_CALL}
+        params = {"limit": self.page_limit}
         if max_id:
             params["max_id"] = max_id
 
@@ -267,6 +268,46 @@ class MastodonChineseScraper:
                 print("Service unavailable (503). Retrying after short delay...")
                 time.sleep(REQUEST_RETRY_DELAY_SECONDS)
                 continue
+
+            if response.status_code == 422:
+                # Some instances restrict the maximum allowed limit value.
+                limit_adjusted = False
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+
+                if (
+                    payload
+                    and isinstance(payload, dict)
+                    and "details" in payload
+                    and isinstance(payload["details"], dict)
+                ):
+                    detail_str = json.dumps(payload["details"])
+                else:
+                    detail_str = str(payload)
+
+                if (
+                    detail_str
+                    and "limit" in detail_str.lower()
+                    and self.page_limit > 20
+                ):
+                    self.page_limit = 20
+                    print(
+                        "Received 422 indicating the page limit is too high. "
+                        "Reducing per-request limit to 20 and retrying..."
+                    )
+                    time.sleep(MIN_REQUEST_INTERVAL_SECONDS)
+                    limit_adjusted = True
+
+                if limit_adjusted:
+                    params["limit"] = self.page_limit
+                    continue
+
+                raise RuntimeError(
+                    "Received 422 Unprocessable Entity response. "
+                    "Please check instance capabilities or adjust parameters."
+                )
 
             # For other status codes, raise the error immediately.
             response.raise_for_status()
