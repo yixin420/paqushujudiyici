@@ -18,8 +18,6 @@ weekly limit, output directory, or authentication token. See the README or the
 `print_usage_instructions` function for detailed guidance.
 """
 
-from __future__ import annotations
-
 import json
 import os
 import re
