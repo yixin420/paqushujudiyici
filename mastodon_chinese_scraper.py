@@ -72,6 +72,8 @@ REQUEST_RETRY_DELAY_SECONDS = 3
 REQUEST_DELAY_SECONDS = 2  # delay between successive pagination requests
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 10
 MIN_PAGE_LIMIT = 5
+MAX_CONSECUTIVE_FETCH_FAILURES = 5
+FETCH_FAILURE_BACKOFF_SECONDS = 30
 
 
 CHINESE_PATTERN = re.compile(
@@ -155,9 +157,26 @@ class MastodonChineseScraper:
 
         max_id: Optional[str] = None
         reached_start = False
+        consecutive_failures = 0
 
         while not reached_start:
-            statuses = self._fetch_public_timeline_page(max_id=max_id)
+            try:
+                statuses = self._fetch_public_timeline_page(max_id=max_id)
+                consecutive_failures = 0
+            except RuntimeError as exc:
+                consecutive_failures += 1
+                print(
+                    "获取公开时间线失败: "
+                    f"{exc}. 已连续失败 {consecutive_failures} 次，"
+                    f"将在 {FETCH_FAILURE_BACKOFF_SECONDS}s 后重试..."
+                )
+                if consecutive_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
+                    raise RuntimeError(
+                        "多次连续失败，停止抓取。请检查网络连接、令牌或目标实例。"
+                    ) from exc
+                time.sleep(FETCH_FAILURE_BACKOFF_SECONDS)
+                continue
+
             if not statuses:
                 break
 
