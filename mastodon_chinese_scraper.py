@@ -523,7 +523,8 @@ Configuration Tips
    - No Chinese results: try a different instance or expand the time range
 
  5. Output:
-     - JSON files are saved under {os.path.abspath(OUTPUT_DIR)}
+     - JSON files are saved under the configured OUTPUT_DIR (default: "{OUTPUT_DIR}")
+       absolute path: {os.path.abspath(OUTPUT_DIR)}
      - Filenames follow the pattern YYYYMMDD_<instance-host>_<count>.json where the host
        portion replaces non-alphanumeric characters with '-'.
      - A rolling {DAILY_SUMMARY_FILENAME} file stores the total count per day.
