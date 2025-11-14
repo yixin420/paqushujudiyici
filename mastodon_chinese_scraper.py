@@ -4,17 +4,18 @@ Mastodon Chinese Posts Daily Scraper
 ====================================
 
 This script collects all public Chinese-language posts (Simplified + Traditional)
-per UTC day from a Mastodon instance within a specified time range. It respects
-Mastodon API rate limits, supports optional Bearer token authentication, and outputs
-daily JSON files along with a rolling CSV summary of per-day totals.
+for the current UTC day from a Mastodon instance. It respects Mastodon API rate
+limits, supports optional Bearer token authentication, and outputs daily JSON
+files along with a rolling CSV summary of per-day totals.
 
+By default, the script automatically sets the scraping window to today's UTC date.
 Default configuration targets https://m.cmx.im.
 
 Usage:
     python mastodon_chinese_scraper.py
 
-Adjust global constants near the top of this file to change the domain, time range,
-output directory, or authentication token. See the README or the
+Adjust global constants near the top of this file to change the domain, output
+directory, or authentication token. See the README or the
 `print_usage_instructions` function for detailed guidance.
 """
 import csv
@@ -36,20 +37,39 @@ from bs4 import BeautifulSoup
 # Configuration (edit as needed)
 # -----------------------------
 BASE_URL = "https://m.cmx.im"
-# UTC time range for scraping
-START_TIME_UTC = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-END_TIME_UTC = datetime(2025, 11, 9, 23, 59, 59, tzinfo=timezone.utc)
+
+# Automatically set the time window to cover today's UTC date.
+_TODAY_UTC = datetime.now(timezone.utc).date()
+START_TIME_UTC = datetime(
+    _TODAY_UTC.year,
+    _TODAY_UTC.month,
+    _TODAY_UTC.day,
+    0,
+    0,
+    0,
+    tzinfo=timezone.utc,
+)
+END_TIME_UTC = datetime(
+    _TODAY_UTC.year,
+    _TODAY_UTC.month,
+    _TODAY_UTC.day,
+    23,
+    59,
+    59,
+    tzinfo=timezone.utc,
+)
+
 # Directory to store per-day outputs
 OUTPUT_DIR = "data"
 # Aggregated summary CSV filename (stored inside OUTPUT_DIR)
 DAILY_SUMMARY_FILENAME = "daily_summary.csv"
 # Optional Mastodon API Bearer token; set to None for anonymous access
-AUTH_BEARER_TOKEN: Optional[str] = None
+AUTH_BEARER_TOKEN: Optional[str] = "XlgSKGYdYD2C4JpblzqSSnvLK4Z3g69oRRYRet36Gjw"
 # Request settings
-REQUEST_LIMIT_PER_CALL = 40
-REQUEST_RETRIES = 3
-REQUEST_RETRY_DELAY_SECONDS = 2
-MIN_REQUEST_INTERVAL_SECONDS = 1
+REQUEST_LIMIT_PER_CALL = 40  # Mastodon API caps this at 40 per request
+REQUEST_RETRIES = 4
+REQUEST_RETRY_DELAY_SECONDS = 3
+REQUEST_DELAY_SECONDS = 2  # delay between successive pagination requests
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 10
 MIN_PAGE_LIMIT = 5
 
@@ -234,7 +254,9 @@ class MastodonChineseScraper:
             self._respect_rate_limit()
             try:
                 response = self.session.get(url, params=params, timeout=30)
+                self._last_request_ts = time.time()
             except (Timeout, RequestsConnectionError) as exc:
+                self._last_request_ts = time.time()
                 print(
                     f"Network timeout/connection error on attempt {attempt + 1} "
                     f"of {REQUEST_RETRIES}: {exc}. Retrying in "
@@ -243,6 +265,7 @@ class MastodonChineseScraper:
                 time.sleep(REQUEST_RETRY_DELAY_SECONDS)
                 continue
             except RequestException as exc:
+                self._last_request_ts = time.time()
                 raise RuntimeError(f"Request failed due to an unexpected error: {exc}") from exc
 
             if response.status_code == 200:
@@ -297,7 +320,7 @@ class MastodonChineseScraper:
                         "Received 422 response, likely due to request limits. "
                         f"Reducing per-request limit to {self.page_limit} and retrying..."
                     )
-                    time.sleep(MIN_REQUEST_INTERVAL_SECONDS)
+                    time.sleep(REQUEST_DELAY_SECONDS)
                     continue
 
                 raise RuntimeError(
@@ -311,10 +334,10 @@ class MastodonChineseScraper:
         raise RuntimeError("Failed to fetch public timeline after multiple attempts.")
 
     def _respect_rate_limit(self) -> None:
-        """Ensure at least MIN_REQUEST_INTERVAL_SECONDS between requests."""
+        """Ensure at least REQUEST_DELAY_SECONDS between requests."""
         elapsed = time.time() - self._last_request_ts
-        if elapsed < MIN_REQUEST_INTERVAL_SECONDS:
-            time.sleep(MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+        if elapsed < REQUEST_DELAY_SECONDS:
+            time.sleep(REQUEST_DELAY_SECONDS - elapsed)
 
     def _update_rate_limit_state(self, headers: dict) -> None:
         """Update the last request timestamp and optionally log remaining quota."""
@@ -455,15 +478,16 @@ Configuration Tips
      e.g. BASE_URL = "https://mastodon.social"
 
  2. Adjusting time range:
-    - Modify START_TIME_UTC and END_TIME_UTC (keep timezone=timezone.utc)
+    - By default the script targets today's UTC day.
+    - Modify START_TIME_UTC and END_TIME_UTC manually if you need a different window (keep timezone=timezone.utc).
 
 3. Providing a Bearer token:
    - Set AUTH_BEARER_TOKEN = "YOUR_ACCESS_TOKEN"
    - Token is required if the instance enforces authentication (401 responses)
 
-4. Handling common errors:
-   - 401 Unauthorized: set AUTH_BEARER_TOKEN
-   - 429 Too Many Requests: the script will wait automatically; increase MIN_REQUEST_INTERVAL_SECONDS if needed
+ 4. Handling common errors:
+    - 401 Unauthorized: set AUTH_BEARER_TOKEN
+    - 429 Too Many Requests: the script will wait automatically; increase REQUEST_DELAY_SECONDS if needed
    - 503 Service Unavailable: the script retries; you may rerun later if the issue persists
    - No Chinese results: try a different instance or expand the time range
 
