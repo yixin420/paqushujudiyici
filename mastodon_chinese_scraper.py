@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Mastodon Chinese Posts Weekly Scraper
-=====================================
+Mastodon Chinese Posts Daily Scraper
+====================================
 
-This script collects the top 100 public Chinese-language posts (Simplified + Traditional)
-per ISO week from a Mastodon instance within a specified UTC time range. It respects
-Mastodon API rate limits, supports optional Bearer token authentication, and outputs
-weekly JSON files containing the required fields only.
+This script collects all public Chinese-language posts (Simplified + Traditional)
+for the current UTC day from a Mastodon instance. It respects Mastodon API rate
+limits, supports optional Bearer token authentication, and outputs daily JSON
+files along with a rolling CSV summary of per-day totals.
 
+By default, the script automatically sets the scraping window to today's UTC date.
 Default configuration targets https://m.cmx.im.
 
 Usage:
     python mastodon_chinese_scraper.py
 
-Adjust global constants near the top of this file to change the domain, time range,
-weekly limit, output directory, or authentication token. See the README or the
+Adjust global constants near the top of this file to change the domain, output
+directory, or authentication token. See the README or the
 `print_usage_instructions` function for detailed guidance.
 """
-
+import csv
 import json
 import os
 import re
@@ -36,22 +37,43 @@ from bs4 import BeautifulSoup
 # Configuration (edit as needed)
 # -----------------------------
 BASE_URL = "https://m.cmx.im"
-# UTC time range for scraping
-START_TIME_UTC = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-END_TIME_UTC = datetime(2025, 11, 9, 23, 59, 59, tzinfo=timezone.utc)
-# Weekly post cap
-WEEKLY_LIMIT = 100
-# Directory to store JSON outputs
+
+# Automatically set the time window to cover today's UTC date.
+_TODAY_UTC = datetime.now(timezone.utc).date()
+START_TIME_UTC = datetime(
+    _TODAY_UTC.year,
+    _TODAY_UTC.month,
+    _TODAY_UTC.day,
+    0,
+    0,
+    0,
+    tzinfo=timezone.utc,
+)
+END_TIME_UTC = datetime(
+    _TODAY_UTC.year,
+    _TODAY_UTC.month,
+    _TODAY_UTC.day,
+    23,
+    59,
+    59,
+    tzinfo=timezone.utc,
+)
+
+# Directory to store per-day outputs
 OUTPUT_DIR = "data"
+# Aggregated summary CSV filename (stored inside OUTPUT_DIR)
+DAILY_SUMMARY_FILENAME = "daily_summary.csv"
 # Optional Mastodon API Bearer token; set to None for anonymous access
-AUTH_BEARER_TOKEN: Optional[str] = None
+AUTH_BEARER_TOKEN: Optional[str] = "XlgSKGYdYD2C4JpblzqSSnvLK4Z3g69oRRYRet36Gjw"
 # Request settings
-REQUEST_LIMIT_PER_CALL = 40
-REQUEST_RETRIES = 3
-REQUEST_RETRY_DELAY_SECONDS = 2
-MIN_REQUEST_INTERVAL_SECONDS = 1
+REQUEST_LIMIT_PER_CALL = 40  # Mastodon API caps this at 40 per request
+REQUEST_RETRIES = 4
+REQUEST_RETRY_DELAY_SECONDS = 3
+REQUEST_DELAY_SECONDS = 2  # delay between successive pagination requests
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 10
 MIN_PAGE_LIMIT = 5
+MAX_CONSECUTIVE_FETCH_FAILURES = 5
+FETCH_FAILURE_BACKOFF_SECONDS = 30
 
 
 CHINESE_PATTERN = re.compile(
@@ -60,32 +82,29 @@ CHINESE_PATTERN = re.compile(
 
 
 @dataclass(frozen=True)
-class WeekWindow:
-    """Represents a single ISO week window."""
+class DayWindow:
+    """Represents a single UTC day window."""
 
-    iso_year: int
-    iso_week: int
     start: datetime
     end: datetime
 
     @property
     def key(self) -> str:
-        return f"{self.iso_year}_week{self.iso_week:02d}"
+        return self.start.strftime("%Y-%m-%d")
 
     @property
     def filename(self) -> str:
-        return f"{self.key}_chinese_posts.json"
+        return f"{self.start.strftime('%Y%m%d')}_data.json"
 
 
 class MastodonChineseScraper:
-    """Collects weekly top N Chinese-language posts from a Mastodon instance."""
+    """Collects all Chinese-language posts per UTC day from a Mastodon instance."""
 
     def __init__(
         self,
         base_url: str,
         start_time: datetime,
         end_time: datetime,
-        weekly_limit: int = 100,
         output_dir: str = "data",
         auth_token: Optional[str] = None,
     ) -> None:
@@ -97,9 +116,9 @@ class MastodonChineseScraper:
         self.base_url = base_url.rstrip("/")
         self.start_time = start_time
         self.end_time = end_time
-        self.weekly_limit = weekly_limit
         self.auth_token = auth_token
         self.output_dir = output_dir
+        self.summary_path = os.path.join(self.output_dir, DAILY_SUMMARY_FILENAME)
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -125,20 +144,39 @@ class MastodonChineseScraper:
 
     def run(self) -> Dict[str, List[dict]]:
         """
-        Execute the scraper and return a mapping of week key to collected posts.
-        JSON files are saved for each week encountered within the time range.
+        Execute the scraper and return a mapping of day key to collected posts.
+        JSON files are saved for each day encountered within the time range.
         """
-        week_windows = self._prepare_week_windows()
-        remaining_weeks = {w.key for w in week_windows}
-        weekly_posts: Dict[str, List[dict]] = {w.key: [] for w in week_windows}
-        week_lookup: Dict[str, WeekWindow] = {w.key: w for w in week_windows}
+        day_windows = self._prepare_day_windows()
+        if not day_windows:
+            return {}
+
+        daily_posts: Dict[str, List[dict]] = {w.key: [] for w in day_windows}
+        day_lookup: Dict[str, DayWindow] = {w.key: w for w in day_windows}
         seen_ids: set[str] = set()
 
         max_id: Optional[str] = None
         reached_start = False
+        consecutive_failures = 0
 
-        while not reached_start and remaining_weeks:
-            statuses = self._fetch_public_timeline_page(max_id=max_id)
+        while not reached_start:
+            try:
+                statuses = self._fetch_public_timeline_page(max_id=max_id)
+                consecutive_failures = 0
+            except RuntimeError as exc:
+                consecutive_failures += 1
+                print(
+                    "获取公开时间线失败: "
+                    f"{exc}. 已连续失败 {consecutive_failures} 次，"
+                    f"将在 {FETCH_FAILURE_BACKOFF_SECONDS}s 后重试..."
+                )
+                if consecutive_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
+                    raise RuntimeError(
+                        "多次连续失败，停止抓取。请检查网络连接、令牌或目标实例。"
+                    ) from exc
+                time.sleep(FETCH_FAILURE_BACKOFF_SECONDS)
+                continue
+
             if not statuses:
                 break
 
@@ -167,8 +205,8 @@ class MastodonChineseScraper:
                 if not self._contains_chinese(plain_content):
                     continue
 
-                week_key = self._week_key_for_datetime(created_at)
-                if week_key not in remaining_weeks:
+                day_key = self._day_key_for_datetime(created_at)
+                if day_key not in daily_posts:
                     continue
 
                 # Prepare record with required fields only.
@@ -184,38 +222,35 @@ class MastodonChineseScraper:
                     "content": plain_content,
                 }
 
-                weekly_posts[week_key].append(record)
+                daily_posts[day_key].append(record)
                 seen_ids.add(post_id)
 
-                if len(weekly_posts[week_key]) >= self.weekly_limit:
-                    remaining_weeks.discard(week_key)
-
             # Safety: sort each week's posts in descending chronological order.
-            for key, posts in weekly_posts.items():
+            for key, posts in daily_posts.items():
                 posts.sort(key=lambda item: item["created_at"], reverse=True)
 
-        self._save_weekly_outputs(weekly_posts, week_lookup)
-        return weekly_posts
+        self._save_daily_outputs(daily_posts, day_lookup)
+        return daily_posts
 
     def print_sample_posts(
-        self, weekly_posts: Dict[str, List[dict]], sample_size: int = 5
+        self, daily_posts: Dict[str, List[dict]], sample_size: int = 5
     ) -> None:
-        """Print up to `sample_size` posts across all weeks for quick inspection."""
+        """Print up to `sample_size` posts across all collected days for quick inspection."""
         flattened: List[Tuple[str, dict]] = []
-        for week_key, posts in weekly_posts.items():
+        for day_key, posts in daily_posts.items():
             for post in posts:
-                flattened.append((week_key, post))
+                flattened.append((day_key, post))
 
         flattened.sort(
             key=lambda pair: pair[1]["created_at"] or "", reverse=True
         )
         print(f"\nSample of up to {sample_size} Chinese-language posts:")
-        for week_key, post in flattened[:sample_size]:
+        for day_key, post in flattened[:sample_size]:
             created_at = post.get("created_at", "")
             username = post.get("username", "")
             display = post.get("display_name", "")
             print(
-                f"[{week_key}] {created_at} — {username} ({display})\n"
+                f"[{day_key}] {created_at} — {username} ({display})\n"
                 f"URL: {post.get('url', '')}\n"
                 f"Content: {post.get('content', '')}\n"
                 "-" * 60
@@ -238,7 +273,9 @@ class MastodonChineseScraper:
             self._respect_rate_limit()
             try:
                 response = self.session.get(url, params=params, timeout=30)
+                self._last_request_ts = time.time()
             except (Timeout, RequestsConnectionError) as exc:
+                self._last_request_ts = time.time()
                 print(
                     f"Network timeout/connection error on attempt {attempt + 1} "
                     f"of {REQUEST_RETRIES}: {exc}. Retrying in "
@@ -247,6 +284,7 @@ class MastodonChineseScraper:
                 time.sleep(REQUEST_RETRY_DELAY_SECONDS)
                 continue
             except RequestException as exc:
+                self._last_request_ts = time.time()
                 raise RuntimeError(f"Request failed due to an unexpected error: {exc}") from exc
 
             if response.status_code == 200:
@@ -301,7 +339,7 @@ class MastodonChineseScraper:
                         "Received 422 response, likely due to request limits. "
                         f"Reducing per-request limit to {self.page_limit} and retrying..."
                     )
-                    time.sleep(MIN_REQUEST_INTERVAL_SECONDS)
+                    time.sleep(REQUEST_DELAY_SECONDS)
                     continue
 
                 raise RuntimeError(
@@ -315,10 +353,10 @@ class MastodonChineseScraper:
         raise RuntimeError("Failed to fetch public timeline after multiple attempts.")
 
     def _respect_rate_limit(self) -> None:
-        """Ensure at least MIN_REQUEST_INTERVAL_SECONDS between requests."""
+        """Ensure at least REQUEST_DELAY_SECONDS between requests."""
         elapsed = time.time() - self._last_request_ts
-        if elapsed < MIN_REQUEST_INTERVAL_SECONDS:
-            time.sleep(MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+        if elapsed < REQUEST_DELAY_SECONDS:
+            time.sleep(REQUEST_DELAY_SECONDS - elapsed)
 
     def _update_rate_limit_state(self, headers: dict) -> None:
         """Update the last request timestamp and optionally log remaining quota."""
@@ -348,52 +386,79 @@ class MastodonChineseScraper:
                 pass
         return float(DEFAULT_RATE_LIMIT_BACKOFF_SECONDS)
 
-    def _save_weekly_outputs(
+    def _save_daily_outputs(
         self,
-        weekly_posts: Dict[str, List[dict]],
-        week_lookup: Dict[str, WeekWindow],
+        daily_posts: Dict[str, List[dict]],
+        day_lookup: Dict[str, DayWindow],
     ) -> None:
-        """Persist weekly JSON files with UTF-8 encoding."""
-        for week_key, posts in weekly_posts.items():
-            if not posts:
-                continue
-
-            filename = week_lookup[week_key].filename
+        """Persist per-day JSON files and update the summary CSV."""
+        summary_rows: List[Tuple[str, int]] = []
+        for day_key in sorted(day_lookup.keys()):
+            posts = daily_posts.get(day_key, [])
+            filename = day_lookup[day_key].filename
             path = os.path.join(self.output_dir, filename)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(posts, f, ensure_ascii=False, indent=2)
-            print(f"Wrote {len(posts)} posts to {path}")
+            print(f"{day_key} 共收集到 {len(posts)} 条数据，写入 {path}")
+            summary_rows.append((day_key, len(posts)))
 
-    def _prepare_week_windows(self) -> List[WeekWindow]:
-        """Generate ISO week windows spanning the configured time range."""
-        windows: List[WeekWindow] = []
-        cursor = self._floor_to_week_start(self.start_time)
+        self._append_daily_summary(summary_rows)
+
+    def _append_daily_summary(self, rows: List[Tuple[str, int]]) -> None:
+        """Create or update the aggregated daily summary CSV."""
+        if not rows:
+            return
+
+        existing: Dict[str, int] = {}
+        if os.path.exists(self.summary_path):
+            with open(self.summary_path, "r", encoding="utf-8", newline="") as csvfile:
+                reader = csv.DictReader(csvfile)
+                for entry in reader:
+                    date_key = entry.get("date")
+                    count_val = entry.get("count")
+                    if not date_key:
+                        continue
+                    try:
+                        existing[date_key] = int(count_val) if count_val is not None else 0
+                    except ValueError:
+                        existing[date_key] = 0
+
+        for day_key, count in rows:
+            existing[day_key] = count
+
+        with open(self.summary_path, "w", encoding="utf-8", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["date", "count"])
+            for day_key in sorted(existing.keys()):
+                writer.writerow([day_key, existing[day_key]])
+
+    def _prepare_day_windows(self) -> List[DayWindow]:
+        """Generate per-day windows spanning the configured time range."""
+        windows: List[DayWindow] = []
+        cursor = self._floor_to_day_start(self.start_time)
 
         while cursor <= self.end_time:
-            iso_year, iso_week, _ = cursor.isocalendar()
-            week_start = cursor
-            week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
-            week_end = min(week_end, self.end_time)
+            day_start = cursor
+            day_end = min(
+                day_start + timedelta(days=1) - timedelta(seconds=1),
+                self.end_time,
+            )
             windows.append(
-                WeekWindow(
-                    iso_year=iso_year,
-                    iso_week=iso_week,
-                    start=week_start,
-                    end=week_end,
+                DayWindow(
+                    start=day_start,
+                    end=day_end,
                 )
             )
-            cursor = week_start + timedelta(days=7)
+            cursor = day_start + timedelta(days=1)
 
         return windows
 
-    def _floor_to_week_start(self, dt: datetime) -> datetime:
-        """Return the Monday 00:00 UTC of the week containing `dt`."""
-        monday = dt - timedelta(days=dt.weekday())
-        return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    def _floor_to_day_start(self, dt: datetime) -> datetime:
+        """Return 00:00 UTC of the day containing `dt`."""
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    def _week_key_for_datetime(self, dt: datetime) -> str:
-        iso_year, iso_week, _ = dt.isocalendar()
-        return f"{iso_year}_week{iso_week:02d}"
+    def _day_key_for_datetime(self, dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%d")
 
     def _html_to_text(self, html: str) -> str:
         """Convert HTML to clean plain text."""
@@ -431,24 +496,25 @@ Configuration Tips
    - Update BASE_URL at the top of this script
      e.g. BASE_URL = "https://mastodon.social"
 
-2. Adjusting time range or weekly quota:
-   - Modify START_TIME_UTC and END_TIME_UTC (keep timezone=timezone.utc)
-   - Adjust WEEKLY_LIMIT as needed (e.g. WEEKLY_LIMIT = 50)
+ 2. Adjusting time range:
+    - By default the script targets today's UTC day.
+    - Modify START_TIME_UTC and END_TIME_UTC manually if you need a different window (keep timezone=timezone.utc).
 
 3. Providing a Bearer token:
    - Set AUTH_BEARER_TOKEN = "YOUR_ACCESS_TOKEN"
    - Token is required if the instance enforces authentication (401 responses)
 
-4. Handling common errors:
-   - 401 Unauthorized: set AUTH_BEARER_TOKEN
-   - 429 Too Many Requests: the script will wait automatically; increase MIN_REQUEST_INTERVAL_SECONDS if needed
+ 4. Handling common errors:
+    - 401 Unauthorized: set AUTH_BEARER_TOKEN
+    - 429 Too Many Requests: the script will wait automatically; increase REQUEST_DELAY_SECONDS if needed
    - 503 Service Unavailable: the script retries; you may rerun later if the issue persists
    - No Chinese results: try a different instance or expand the time range
 
-5. Output:
-   - JSON files are saved under {os.path.abspath(OUTPUT_DIR)}
-   - Filenames follow the pattern 2025_week01_chinese_posts.json
-   - Each record includes only the required fields.
+ 5. Output:
+    - JSON files are saved under {os.path.abspath(OUTPUT_DIR)}
+    - Filenames follow the pattern YYYYMMDD_data.json
+    - A rolling {DAILY_SUMMARY_FILENAME} file stores the total count per day.
+    - Each record includes only the required fields.
 """
     print(instructions)
 
@@ -459,12 +525,11 @@ def main() -> None:
         base_url=BASE_URL,
         start_time=START_TIME_UTC,
         end_time=END_TIME_UTC,
-        weekly_limit=WEEKLY_LIMIT,
         output_dir=OUTPUT_DIR,
         auth_token=AUTH_BEARER_TOKEN,
     )
-    weekly_posts = scraper.run()
-    scraper.print_sample_posts(weekly_posts, sample_size=5)
+    daily_posts = scraper.run()
+    scraper.print_sample_posts(daily_posts, sample_size=5)
 
 
 if __name__ == "__main__":
