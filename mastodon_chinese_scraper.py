@@ -30,6 +30,7 @@ import requests
 from requests import RequestException
 from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 import schedule
 
 
@@ -408,9 +409,12 @@ class MastodonChineseScraper:
         self._append_daily_summary(summary_rows)
 
     def _build_daily_filename(self, day_window: DayWindow, post_count: int) -> str:
-        """Create a filename that includes the date, hostname, and total count."""
-        timestamp_str = day_window.end.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
-        return f"{timestamp_str}.cmx({post_count}).json"
+        """Create a filename with YYYYMMDD_host_slug_count.json format."""
+        day_str = day_window.start.astimezone(timezone.utc).strftime("%Y%m%d")
+        parsed = urlparse(self.base_url)
+        hostname = parsed.hostname or parsed.path or "mastodon"
+        host_slug = re.sub(r"[^A-Za-z0-9]+", "-", hostname).strip("-").lower() or "mastodon"
+        return f"{day_str}_{host_slug}_{post_count}.json"
 
     def _append_daily_summary(self, rows: List[Tuple[str, int]]) -> None:
         """Create or update the aggregated daily summary CSV."""
@@ -519,10 +523,11 @@ Configuration Tips
    - No Chinese results: try a different instance or expand the time range
 
  5. Output:
-    - JSON files are saved under {os.path.abspath(OUTPUT_DIR)}
-    - Filenames follow the pattern YYYYMMDD_<instance>_<count>.json
-    - A rolling {DAILY_SUMMARY_FILENAME} file stores the total count per day.
-    - Each record includes only the required fields.
+     - JSON files are saved under {os.path.abspath(OUTPUT_DIR)}
+     - Filenames follow the pattern YYYYMMDD_<instance-host>_<count>.json where the host
+       portion replaces non-alphanumeric characters with '-'.
+     - A rolling {DAILY_SUMMARY_FILENAME} file stores the total count per day.
+     - Each record includes only the required fields.
 """
     print(instructions)
 
