@@ -527,7 +527,7 @@ Configuration Tips
 
  5. Output:
     - JSON files are saved under {os.path.abspath(OUTPUT_DIR)}
-    - Filenames follow the pattern YYYYMMDD_data.json
+    - Filenames follow the pattern YYYYMMDD_<instance>_<count>.json
     - A rolling {DAILY_SUMMARY_FILENAME} file stores the total count per day.
     - Each record includes only the required fields.
 """
