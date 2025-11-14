@@ -23,13 +23,14 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
 from requests import RequestException
 from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout
 from bs4 import BeautifulSoup
+import schedule
 
 
 # -----------------------------
@@ -45,6 +46,9 @@ WEEKLY_LIMIT = 100
 OUTPUT_DIR = "data"
 # Optional Mastodon API Bearer token; set to None for anonymous access
 AUTH_BEARER_TOKEN: Optional[str] = None
+# Daily scheduler UTC trigger time (24-hour format)
+SCHEDULED_UTC_HOUR = 23
+SCHEDULED_UTC_MINUTE = 55
 # Request settings
 REQUEST_LIMIT_PER_CALL = 40
 REQUEST_RETRIES = 3
@@ -453,8 +457,8 @@ Configuration Tips
     print(instructions)
 
 
-def main() -> None:
-    print_usage_instructions()
+def run_scraper_once() -> None:
+    """Instantiate the scraper, execute a crawl, and print sample posts."""
     scraper = MastodonChineseScraper(
         base_url=BASE_URL,
         start_time=START_TIME_UTC,
@@ -465,6 +469,49 @@ def main() -> None:
     )
     weekly_posts = scraper.run()
     scraper.print_sample_posts(weekly_posts, sample_size=5)
+
+
+def start_daily_scheduler() -> None:
+    """Keep the process alive and trigger the scraper once per day at the target UTC time."""
+
+    last_run_date: Optional[date] = None
+
+    def maybe_run_today() -> None:
+        nonlocal last_run_date
+        now_utc = datetime.now(timezone.utc)
+        if (
+            now_utc.hour == SCHEDULED_UTC_HOUR
+            and now_utc.minute == SCHEDULED_UTC_MINUTE
+        ):
+            if last_run_date == now_utc.date():
+                return
+            print(
+                f"[{now_utc.isoformat()}] Scheduled run triggered at "
+                f"{SCHEDULED_UTC_HOUR:02d}:{SCHEDULED_UTC_MINUTE:02d} UTC."
+            )
+            run_scraper_once()
+            last_run_date = now_utc.date()
+
+    schedule.every().minute.do(maybe_run_today)
+    print(
+        "Scheduler active: waiting for daily run at "
+        f"{SCHEDULED_UTC_HOUR:02d}:{SCHEDULED_UTC_MINUTE:02d} UTC. "
+        "Press Ctrl+C to stop."
+    )
+
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Scheduler stopped by user request.")
+
+
+def main() -> None:
+    print_usage_instructions()
+    print("Running immediate scrape...")
+    run_scraper_once()
+    start_daily_scheduler()
 
 
 if __name__ == "__main__":
