@@ -46,6 +46,8 @@ WEEKLY_LIMIT = 100
 OUTPUT_DIR = "data"
 # Optional Mastodon API Bearer token; set to None for anonymous access
 AUTH_BEARER_TOKEN: Optional[str] = None
+# Toggle to automatically adjust the scraping window to the current UTC day.
+USE_DAILY_ROLLING_WINDOW = True
 # Daily scheduler UTC trigger time (24-hour format)
 SCHEDULED_UTC_HOUR = 23
 SCHEDULED_UTC_MINUTE = 55
@@ -457,12 +459,41 @@ Configuration Tips
     print(instructions)
 
 
-def run_scraper_once() -> None:
+def _daily_time_window(target_date: date) -> Tuple[datetime, datetime]:
+    """Return [00:00, 23:59:59] UTC window for target_date."""
+    start = datetime(
+        target_date.year,
+        target_date.month,
+        target_date.day,
+        0,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
+    end = start + timedelta(days=1) - timedelta(seconds=1)
+    return start, end
+
+
+def _resolve_time_window(target_date: Optional[date]) -> Tuple[datetime, datetime]:
+    """Determine the scraping window, honoring daily rolling mode if enabled."""
+    if target_date is not None:
+        return _daily_time_window(target_date)
+    if USE_DAILY_ROLLING_WINDOW:
+        return _daily_time_window(datetime.now(timezone.utc).date())
+    return START_TIME_UTC, END_TIME_UTC
+
+
+def run_scraper_once(target_date: Optional[date] = None) -> None:
     """Instantiate the scraper, execute a crawl, and print sample posts."""
+    start_time, end_time = _resolve_time_window(target_date)
+    print(
+        "Launching scrape for window "
+        f"{start_time.isoformat()} — {end_time.isoformat()}"
+    )
     scraper = MastodonChineseScraper(
         base_url=BASE_URL,
-        start_time=START_TIME_UTC,
-        end_time=END_TIME_UTC,
+        start_time=start_time,
+        end_time=end_time,
         weekly_limit=WEEKLY_LIMIT,
         output_dir=OUTPUT_DIR,
         auth_token=AUTH_BEARER_TOKEN,
@@ -489,7 +520,8 @@ def start_daily_scheduler() -> None:
                 f"[{now_utc.isoformat()}] Scheduled run triggered at "
                 f"{SCHEDULED_UTC_HOUR:02d}:{SCHEDULED_UTC_MINUTE:02d} UTC."
             )
-            run_scraper_once()
+            target_date = now_utc.date() if USE_DAILY_ROLLING_WINDOW else None
+            run_scraper_once(target_date)
             last_run_date = now_utc.date()
 
     schedule.every().minute.do(maybe_run_today)
@@ -510,7 +542,10 @@ def start_daily_scheduler() -> None:
 def main() -> None:
     print_usage_instructions()
     print("Running immediate scrape...")
-    run_scraper_once()
+    initial_target_date = (
+        datetime.now(timezone.utc).date() if USE_DAILY_ROLLING_WINDOW else None
+    )
+    run_scraper_once(initial_target_date)
     start_daily_scheduler()
 
 

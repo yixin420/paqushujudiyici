@@ -31,6 +31,7 @@ python -m pip install requests beautifulsoup4 schedule
    - `WEEKLY_LIMIT`：每周保留的帖子数量（默认 100）
    - `OUTPUT_DIR`：输出目录
    - `AUTH_BEARER_TOKEN`：若匿名请求返回 401，可填入访问令牌
+   - `USE_DAILY_ROLLING_WINDOW`：默认为 `True`，表示每次运行只抓取“当天”（UTC 00:00:00 至 23:59:59）的公开帖，避免重复抓取历史数据；若想指定固定时间段，可将其置为 `False` 并修改 `START_TIME_UTC`/`END_TIME_UTC`
 
 2. **运行脚本并启用定时任务**  
 
@@ -38,7 +39,9 @@ python -m pip install requests beautifulsoup4 schedule
 python mastodon_chinese_scraper.py
 ```
 
-脚本会立即执行一次爬取，然后保持常驻，通过 `schedule` 库每分钟检查当前 UTC 时间，在每日 `23:55 UTC` 自动再次触发 `MastodonChineseScraper`（包含 `run()` 和 `print_sample_posts()` 流程）。使用 `Ctrl+C` 可手动停止；若需长期运行，建议放入 `tmux`、`screen` 或通过 `systemd`/容器后台运行。
+脚本会立即执行一次爬取，然后保持常驻，通过 `schedule` 库每分钟检查当前 UTC 时间，在每日 `23:55 UTC` 自动再次触发 `MastodonChineseScraper`（包含 `run()` 和 `print_sample_posts()` 流程）。默认开启的 `USE_DAILY_ROLLING_WINDOW` 会让每次定时运行只覆盖当天（UTC）的时间窗口，从而避免重复抓取历史记录。使用 `Ctrl+C` 可手动停止；若需长期运行，建议放入 `tmux`、`screen` 或通过 `systemd`/容器后台运行。
+
+> 若需要改为本地时间，可调整服务器时区或将 `SCHEDULED_UTC_HOUR` / `SCHEDULED_UTC_MINUTE` 改成对应的 UTC 值；`schedule` 调度逻辑会继续以 UTC 判断触发时间。
 
 脚本仍会自动遵守接口每秒至多一次请求、429 时读取 `X-RateLimit-Reset` 并等待后重试，同时对网络异常执行最多 3 次重试（间隔 2 秒）。
 
