@@ -559,13 +559,8 @@ def run_scraper_once(target_date: Optional[date] = None) -> None:
     )
     scraper = MastodonChineseScraper(
         base_url=BASE_URL,
-    scraper = MastodonChineseScraper(
-        base_url=BASE_URL,
         start_time=start_time,
         end_time=end_time,
-        output_dir=OUTPUT_DIR,
-        auth_token=AUTH_BEARER_TOKEN,
-    )
         output_dir=OUTPUT_DIR,
         auth_token=AUTH_BEARER_TOKEN,
     )
