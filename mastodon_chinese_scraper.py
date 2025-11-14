@@ -26,8 +26,6 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
-
 import requests
 from requests import RequestException
 from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout
@@ -411,13 +409,8 @@ class MastodonChineseScraper:
 
     def _build_daily_filename(self, day_window: DayWindow, post_count: int) -> str:
         """Create a filename that includes the date, hostname, and total count."""
-        parsed = urlparse(self.base_url)
-        hostname = parsed.netloc or parsed.path or "mastodon"
-        safe_hostname = re.sub(r"[^A-Za-z0-9]+", "-", hostname).strip("-")
-        if not safe_hostname:
-            safe_hostname = "instance"
-        date_str = day_window.start.strftime("%Y%m%d")
-        return f"{date_str}_{safe_hostname}_{post_count}.json"
+        timestamp_str = day_window.end.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
+        return f"{timestamp_str}.cmx({post_count}).json"
 
     def _append_daily_summary(self, rows: List[Tuple[str, int]]) -> None:
         """Create or update the aggregated daily summary CSV."""
