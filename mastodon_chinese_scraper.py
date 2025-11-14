@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from requests import RequestException
@@ -98,10 +99,6 @@ class DayWindow:
     @property
     def key(self) -> str:
         return self.start.strftime("%Y-%m-%d")
-
-    @property
-    def filename(self) -> str:
-        return f"{self.start.strftime('%Y%m%d')}_data.json"
 
 
 class MastodonChineseScraper:
@@ -402,7 +399,8 @@ class MastodonChineseScraper:
         summary_rows: List[Tuple[str, int]] = []
         for day_key in sorted(day_lookup.keys()):
             posts = daily_posts.get(day_key, [])
-            filename = day_lookup[day_key].filename
+            day_window = day_lookup[day_key]
+            filename = self._build_daily_filename(day_window, len(posts))
             path = os.path.join(self.output_dir, filename)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(posts, f, ensure_ascii=False, indent=2)
@@ -410,6 +408,16 @@ class MastodonChineseScraper:
             summary_rows.append((day_key, len(posts)))
 
         self._append_daily_summary(summary_rows)
+
+    def _build_daily_filename(self, day_window: DayWindow, post_count: int) -> str:
+        """Create a filename that includes the date, hostname, and total count."""
+        parsed = urlparse(self.base_url)
+        hostname = parsed.netloc or parsed.path or "mastodon"
+        safe_hostname = re.sub(r"[^A-Za-z0-9]+", "-", hostname).strip("-")
+        if not safe_hostname:
+            safe_hostname = "instance"
+        date_str = day_window.start.strftime("%Y%m%d")
+        return f"{date_str}_{safe_hostname}_{post_count}.json"
 
     def _append_daily_summary(self, rows: List[Tuple[str, int]]) -> None:
         """Create or update the aggregated daily summary CSV."""
