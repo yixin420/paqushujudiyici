@@ -46,7 +46,7 @@ python mastodon_chinese_scraper.py
 脚本仍会自动遵守接口每秒至多一次请求、429 时读取 `X-RateLimit-Reset` 并等待后重试，同时对网络异常执行最多 3 次重试（间隔 2 秒）。
 
 3. **输出结果**  
-   - 每天的数据会保存为 `YYYYMMDD_<实例域名>_<当日数量>.json`（例如 `20251114_m-cmx-im_42.json`），位于 `OUTPUT_DIR`（默认 `data/`）
+   - 每天的数据会保存为 `YYYYMMDD_<实例域名>_<当日数量>.json`，域名中的 `.`、`:` 等字符会转成 `-`（例如 `https://m.cmx.im` -> `m-cmx-im`，最终文件名形如 `20251114_m-cmx-im_42.json`），位于 `OUTPUT_DIR`（默认 `data/`）
    - JSON 中仅包含以下字段：`id`、`account_id`、`username`、`display_name`、`note`、`created_at`、`url`、`content`
    - 运行结束会打印前 5 条中文帖子的调试信息，便于快速验证
 
