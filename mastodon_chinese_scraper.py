@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from requests import RequestException
@@ -74,6 +75,8 @@ DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 10
 MIN_PAGE_LIMIT = 5
 MAX_CONSECUTIVE_FETCH_FAILURES = 5
 FETCH_FAILURE_BACKOFF_SECONDS = 30
+WAIT_FOR_DAY_COMPLETION = True
+LIVE_POLL_INTERVAL_SECONDS = 60
 
 
 CHINESE_PATTERN = re.compile(
@@ -119,6 +122,7 @@ class MastodonChineseScraper:
         self.auth_token = auth_token
         self.output_dir = output_dir
         self.summary_path = os.path.join(self.output_dir, DAILY_SUMMARY_FILENAME)
+        self.instance_slug = self._derive_instance_slug(self.base_url)
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -154,6 +158,7 @@ class MastodonChineseScraper:
         daily_posts: Dict[str, List[dict]] = {w.key: [] for w in day_windows}
         day_lookup: Dict[str, DayWindow] = {w.key: w for w in day_windows}
         seen_ids: set[str] = set()
+        latest_seen_id: Optional[str] = None
 
         max_id: Optional[str] = None
         reached_start = False
@@ -161,7 +166,7 @@ class MastodonChineseScraper:
 
         while not reached_start:
             try:
-                statuses = self._fetch_public_timeline_page(max_id=max_id)
+                statuses = self._fetch_timeline_page(max_id=max_id)
                 consecutive_failures = 0
             except RuntimeError as exc:
                 consecutive_failures += 1
@@ -180,54 +185,31 @@ class MastodonChineseScraper:
             if not statuses:
                 break
 
-            max_id = statuses[-1]["id"]
-            for status in statuses:
-                created_at = self._parse_datetime(status.get("created_at"))
-                if created_at is None:
-                    continue
+            if statuses[-1].get("id"):
+                max_id = statuses[-1]["id"]
+            latest_seen_id, crossed_start = self._process_status_batch(
+                statuses=statuses,
+                daily_posts=daily_posts,
+                day_lookup=day_lookup,
+                seen_ids=seen_ids,
+                latest_seen_id=latest_seen_id,
+                stop_on_start=True,
+            )
+            if crossed_start:
+                reached_start = True
 
-                if created_at > self.end_time:
-                    # Newer than our window; skip but continue processing.
-                    continue
-                if created_at < self.start_time:
-                    # We've gone past our desired start time; we can exit after this page.
-                    reached_start = True
-                    continue
-
-                if status.get("visibility") != "public":
-                    continue
-
-                post_id = status.get("id")
-                if not post_id or post_id in seen_ids:
-                    continue
-
-                plain_content = self._html_to_text(status.get("content", ""))
-                if not self._contains_chinese(plain_content):
-                    continue
-
-                day_key = self._day_key_for_datetime(created_at)
-                if day_key not in daily_posts:
-                    continue
-
-                # Prepare record with required fields only.
-                account = status.get("account", {}) or {}
-                record = {
-                    "id": post_id,
-                    "account_id": account.get("id"),
-                    "username": account.get("username"),
-                    "display_name": self._html_to_text(account.get("display_name", "")),
-                    "note": self._html_to_text(account.get("note", "")),
-                    "created_at": status.get("created_at"),
-                    "url": status.get("url"),
-                    "content": plain_content,
-                }
-
-                daily_posts[day_key].append(record)
-                seen_ids.add(post_id)
-
-            # Safety: sort each week's posts in descending chronological order.
-            for key, posts in daily_posts.items():
-                posts.sort(key=lambda item: item["created_at"], reverse=True)
+        now_utc = datetime.now(timezone.utc)
+        if WAIT_FOR_DAY_COMPLETION and now_utc < self.end_time:
+            print(
+                f"当前 UTC 时间 {now_utc.isoformat()} 尚未到达结束时间 "
+                f"{self.end_time.isoformat()}，将进入实时监听模式以捕获全天数据。"
+            )
+            latest_seen_id = self._follow_day_forward(
+                latest_seen_id=latest_seen_id,
+                daily_posts=daily_posts,
+                day_lookup=day_lookup,
+                seen_ids=seen_ids,
+            )
 
         self._save_daily_outputs(daily_posts, day_lookup)
         return daily_posts
@@ -260,14 +242,22 @@ class MastodonChineseScraper:
     # Internal helpers
     # -----------------------------
 
-    def _fetch_public_timeline_page(
-        self, max_id: Optional[str] = None
+    def _fetch_timeline_page(
+        self, max_id: Optional[str] = None, min_id: Optional[str] = None
     ) -> List[dict]:
-        """Fetch a single page from the public timeline with retries and rate limiting."""
+        """
+        Fetch a single page from the configured timeline with retries and rate limiting.
+
+        Uses `/api/v1/timelines/public` by default and supports both backward pagination
+        via `max_id` and forward pagination via `min_id`, matching the Mastodon
+        timeline API behaviors described in the official documentation.
+        """
         url = f"{self.base_url}/api/v1/timelines/public"
         params = {"limit": self.page_limit}
         if max_id:
             params["max_id"] = max_id
+        if min_id:
+            params["min_id"] = min_id
 
         for attempt in range(REQUEST_RETRIES):
             self._respect_rate_limit()
@@ -386,6 +376,68 @@ class MastodonChineseScraper:
                 pass
         return float(DEFAULT_RATE_LIMIT_BACKOFF_SECONDS)
 
+    def _follow_day_forward(
+        self,
+        latest_seen_id: Optional[str],
+        daily_posts: Dict[str, List[dict]],
+        day_lookup: Dict[str, DayWindow],
+        seen_ids: set[str],
+    ) -> Optional[str]:
+        """
+        Continue polling the public timeline until END_TIME_UTC in order to capture
+        every post published within the current UTC day.
+        """
+        if latest_seen_id is None:
+            print(
+                "尚未记录最新的时间线 ID，实时监听将从当前最新公开时间线开始。"
+            )
+
+        poll_round = 0
+        while datetime.now(timezone.utc) < self.end_time:
+            poll_round += 1
+            statuses = self._fetch_timeline_page(min_id=latest_seen_id)
+            if statuses:
+                print(
+                    f"[实时轮询 #{poll_round}] 获取到 {len(statuses)} 条新增数据，正在过滤..."
+                )
+            latest_seen_id, _ = self._process_status_batch(
+                statuses=statuses,
+                daily_posts=daily_posts,
+                day_lookup=day_lookup,
+                seen_ids=seen_ids,
+                latest_seen_id=latest_seen_id,
+                stop_on_start=False,
+            )
+
+            remaining_seconds = (
+                self.end_time - datetime.now(timezone.utc)
+            ).total_seconds()
+            if remaining_seconds <= 0:
+                break
+
+            sleep_seconds = min(LIVE_POLL_INTERVAL_SECONDS, remaining_seconds)
+            if sleep_seconds > 0:
+                print(
+                    f"[实时轮询 #{poll_round}] 距离当天结束还有 "
+                    f"{remaining_seconds/60:.1f} 分钟，休眠 {sleep_seconds:.0f} 秒后继续..."
+                )
+                time.sleep(sleep_seconds)
+
+        # Final sweep to cover posts published right before END_TIME_UTC.
+        final_statuses = self._fetch_timeline_page(min_id=latest_seen_id)
+        if final_statuses:
+            print("执行日终补抓，确保包含收盘前的所有帖子...")
+            latest_seen_id, _ = self._process_status_batch(
+                statuses=final_statuses,
+                daily_posts=daily_posts,
+                day_lookup=day_lookup,
+                seen_ids=seen_ids,
+                latest_seen_id=latest_seen_id,
+                stop_on_start=False,
+            )
+
+        return latest_seen_id
+
     def _save_daily_outputs(
         self,
         daily_posts: Dict[str, List[dict]],
@@ -395,7 +447,7 @@ class MastodonChineseScraper:
         summary_rows: List[Tuple[str, int]] = []
         for day_key in sorted(day_lookup.keys()):
             posts = daily_posts.get(day_key, [])
-            filename = day_lookup[day_key].filename
+            filename = self._build_daily_filename(day_key, len(posts))
             path = os.path.join(self.output_dir, filename)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(posts, f, ensure_ascii=False, indent=2)
@@ -432,6 +484,12 @@ class MastodonChineseScraper:
             for day_key in sorted(existing.keys()):
                 writer.writerow([day_key, existing[day_key]])
 
+    def _build_daily_filename(self, day_key: str, count: int) -> str:
+        """Return the configured storage filename for a given day."""
+        date_str = day_key.replace("-", "")
+        safe_count = max(count, 0)
+        return f"{date_str}_{self.instance_slug}_({safe_count}).json"
+
     def _prepare_day_windows(self) -> List[DayWindow]:
         """Generate per-day windows spanning the configured time range."""
         windows: List[DayWindow] = []
@@ -459,6 +517,111 @@ class MastodonChineseScraper:
 
     def _day_key_for_datetime(self, dt: datetime) -> str:
         return dt.strftime("%Y-%m-%d")
+
+    def _derive_instance_slug(self, base_url: str) -> str:
+        """Derive a filesystem-friendly slug from the target instance URL."""
+        parsed = urlparse(base_url)
+        host = parsed.netloc or parsed.path or base_url
+        slug = host.strip().lower().replace(".", "-").replace(":", "-").strip("-")
+        return slug or "mastodon-instance"
+
+    def _process_status_batch(
+        self,
+        statuses: List[dict],
+        daily_posts: Dict[str, List[dict]],
+        day_lookup: Dict[str, DayWindow],
+        seen_ids: set[str],
+        latest_seen_id: Optional[str],
+        stop_on_start: bool,
+    ) -> Tuple[Optional[str], bool]:
+        """Process a list of statuses and return the updated cursors."""
+        reached_start = False
+        for status in statuses:
+            post_id = status.get("id")
+            latest_seen_id = self._update_latest_seen_id(latest_seen_id, post_id)
+
+            created_at = self._parse_datetime(status.get("created_at"))
+            if created_at is None:
+                continue
+
+            if created_at > self.end_time:
+                continue
+
+            if created_at < self.start_time:
+                if stop_on_start:
+                    reached_start = True
+                continue
+
+            self._ingest_status(
+                status=status,
+                created_at=created_at,
+                daily_posts=daily_posts,
+                day_lookup=day_lookup,
+                seen_ids=seen_ids,
+            )
+
+        return latest_seen_id, reached_start
+
+    def _ingest_status(
+        self,
+        status: dict,
+        created_at: datetime,
+        daily_posts: Dict[str, List[dict]],
+        day_lookup: Dict[str, DayWindow],
+        seen_ids: set[str],
+    ) -> bool:
+        """Normalize, deduplicate, and append a status to the per-day bucket."""
+        if status.get("visibility") != "public":
+            return False
+
+        post_id = status.get("id")
+        if not post_id or post_id in seen_ids:
+            return False
+
+        plain_content = self._html_to_text(status.get("content", ""))
+        if not self._contains_chinese(plain_content):
+            return False
+
+        day_key = self._day_key_for_datetime(created_at)
+        if day_key not in daily_posts:
+            return False
+
+        account = status.get("account", {}) or {}
+        record = {
+            "id": post_id,
+            "account_id": account.get("id"),
+            "username": account.get("username"),
+            "display_name": self._html_to_text(account.get("display_name", "")),
+            "note": self._html_to_text(account.get("note", "")),
+            "created_at": status.get("created_at"),
+            "url": status.get("url"),
+            "content": plain_content,
+        }
+
+        daily_posts[day_key].append(record)
+        seen_ids.add(post_id)
+        self._sort_day_posts(daily_posts[day_key])
+        return True
+
+    def _sort_day_posts(self, posts: List[dict]) -> None:
+        """Sort posts for a given day in reverse chronological order."""
+        posts.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+
+    def _update_latest_seen_id(
+        self, current_latest: Optional[str], candidate: Optional[str]
+    ) -> Optional[str]:
+        """Track the greatest Mastodon status ID encountered so far."""
+        if candidate is None:
+            return current_latest
+        if current_latest is None:
+            return candidate
+        try:
+            if int(candidate) > int(current_latest):
+                return candidate
+        except ValueError:
+            if candidate > current_latest:
+                return candidate
+        return current_latest
 
     def _html_to_text(self, html: str) -> str:
         """Convert HTML to clean plain text."""
@@ -496,25 +659,29 @@ Configuration Tips
    - Update BASE_URL at the top of this script
      e.g. BASE_URL = "https://mastodon.social"
 
- 2. Adjusting time range:
-    - By default the script targets today's UTC day.
-    - Modify START_TIME_UTC and END_TIME_UTC manually if you need a different window (keep timezone=timezone.utc).
+2. Adjusting time range:
+   - By default the script targets today's UTC day.
+   - Modify START_TIME_UTC and END_TIME_UTC manually if you need a different window (keep timezone=timezone.utc).
 
 3. Providing a Bearer token:
    - Set AUTH_BEARER_TOKEN = "YOUR_ACCESS_TOKEN"
    - Token is required if the instance enforces authentication (401 responses)
 
- 4. Handling common errors:
-    - 401 Unauthorized: set AUTH_BEARER_TOKEN
-    - 429 Too Many Requests: the script will wait automatically; increase REQUEST_DELAY_SECONDS if needed
+4. Handling common errors:
+   - 401 Unauthorized: set AUTH_BEARER_TOKEN
+   - 429 Too Many Requests: the script will wait automatically; increase REQUEST_DELAY_SECONDS if needed
    - 503 Service Unavailable: the script retries; you may rerun later if the issue persists
    - No Chinese results: try a different instance or expand the time range
 
- 5. Output:
-    - JSON files are saved under {os.path.abspath(OUTPUT_DIR)}
-    - Filenames follow the pattern YYYYMMDD_data.json
-    - A rolling {DAILY_SUMMARY_FILENAME} file stores the total count per day.
-    - Each record includes only the required fields.
+5. Output:
+   - JSON files are saved under {os.path.abspath(OUTPUT_DIR)}
+   - Filenames follow the pattern YYYYMMDD_instance-slug_(<daily_count>).json
+   - A rolling {DAILY_SUMMARY_FILENAME} file stores the total count per day.
+   - Each record includes only the required fields.
+
+6. Full-day capture mode:
+   - When WAIT_FOR_DAY_COMPLETION is True the scraper keeps polling with min_id until END_TIME_UTC.
+   - Adjust LIVE_POLL_INTERVAL_SECONDS to control how often new statuses are requested during this mode.
 """
     print(instructions)
 
