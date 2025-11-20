@@ -19,6 +19,7 @@ directory, or authentication token. See the README or the
 `print_usage_instructions` function for detailed guidance.
 """
 import csv
+import glob
 import json
 import os
 import re
@@ -155,6 +156,8 @@ class MastodonChineseScraper:
         # Some instances reject the maximum limit=40; start with the configured value
         # and reduce dynamically if we encounter 422 errors.
         self.page_limit: int = REQUEST_LIMIT_PER_CALL
+        self._day_file_paths: Dict[str, str] = {}
+        self._summary_cache: Dict[str, int] = self._load_summary_cache()
 
     # -----------------------------
     # Public entry points
@@ -169,63 +172,74 @@ class MastodonChineseScraper:
         if not day_windows:
             return {}
 
-        daily_posts: Dict[str, List[dict]] = {w.key: [] for w in day_windows}
+        daily_posts: Dict[str, List[dict]] = {}
         day_lookup: Dict[str, DayWindow] = {w.key: w for w in day_windows}
         seen_ids: set[str] = set()
+        for window in day_windows:
+            posts, path = self._load_existing_day_data(window.key)
+            daily_posts[window.key] = posts
+            if path:
+                self._day_file_paths[window.key] = path
+                self._update_summary_entry(window.key, len(posts))
+            for record in posts:
+                post_id = record.get("id")
+                if post_id:
+                    seen_ids.add(post_id)
         latest_seen_id: Optional[str] = None
 
         max_id: Optional[str] = None
         reached_start = False
         consecutive_failures = 0
 
-        while not reached_start:
-            try:
-                statuses = self._fetch_timeline_page(max_id=max_id)
-                consecutive_failures = 0
-            except RuntimeError as exc:
-                consecutive_failures += 1
-                print(
-                    "获取公开时间线失败: "
-                    f"{exc}. 已连续失败 {consecutive_failures} 次，"
-                    f"将在 {FETCH_FAILURE_BACKOFF_SECONDS}s 后重试..."
+        try:
+            while not reached_start:
+                try:
+                    statuses = self._fetch_timeline_page(max_id=max_id)
+                    consecutive_failures = 0
+                except RuntimeError as exc:
+                    consecutive_failures += 1
+                    print(
+                        "获取公开时间线失败: "
+                        f"{exc}. 已连续失败 {consecutive_failures} 次，"
+                        f"将在 {FETCH_FAILURE_BACKOFF_SECONDS}s 后重试..."
+                    )
+                    if consecutive_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
+                        raise RuntimeError(
+                            "多次连续失败，停止抓取。请检查网络连接、令牌或目标实例。"
+                        ) from exc
+                    time.sleep(FETCH_FAILURE_BACKOFF_SECONDS)
+                    continue
+
+                if not statuses:
+                    break
+
+                if statuses[-1].get("id"):
+                    max_id = statuses[-1]["id"]
+                latest_seen_id, crossed_start = self._process_status_batch(
+                    statuses=statuses,
+                    daily_posts=daily_posts,
+                    day_lookup=day_lookup,
+                    seen_ids=seen_ids,
+                    latest_seen_id=latest_seen_id,
+                    stop_on_start=True,
                 )
-                if consecutive_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
-                    raise RuntimeError(
-                        "多次连续失败，停止抓取。请检查网络连接、令牌或目标实例。"
-                    ) from exc
-                time.sleep(FETCH_FAILURE_BACKOFF_SECONDS)
-                continue
+                if crossed_start:
+                    reached_start = True
 
-            if not statuses:
-                break
-
-            if statuses[-1].get("id"):
-                max_id = statuses[-1]["id"]
-            latest_seen_id, crossed_start = self._process_status_batch(
-                statuses=statuses,
-                daily_posts=daily_posts,
-                day_lookup=day_lookup,
-                seen_ids=seen_ids,
-                latest_seen_id=latest_seen_id,
-                stop_on_start=True,
-            )
-            if crossed_start:
-                reached_start = True
-
-        now_utc = datetime.now(timezone.utc)
-        if WAIT_FOR_DAY_COMPLETION and now_utc < self.end_time:
-            print(
-                f"当前 UTC 时间 {now_utc.isoformat()} 尚未到达结束时间 "
-                f"{self.end_time.isoformat()}，将进入实时监听模式以捕获全天数据。"
-            )
-            latest_seen_id = self._follow_day_forward(
-                latest_seen_id=latest_seen_id,
-                daily_posts=daily_posts,
-                day_lookup=day_lookup,
-                seen_ids=seen_ids,
-            )
-
-        self._save_daily_outputs(daily_posts, day_lookup)
+            now_utc = datetime.now(timezone.utc)
+            if WAIT_FOR_DAY_COMPLETION and now_utc < self.end_time:
+                print(
+                    f"当前 UTC 时间 {now_utc.isoformat()} 尚未到达结束时间 "
+                    f"{self.end_time.isoformat()}，将进入实时监听模式以捕获全天数据。"
+                )
+                latest_seen_id = self._follow_day_forward(
+                    latest_seen_id=latest_seen_id,
+                    daily_posts=daily_posts,
+                    day_lookup=day_lookup,
+                    seen_ids=seen_ids,
+                )
+        finally:
+            self._save_daily_outputs(daily_posts, day_lookup)
         return daily_posts
 
     def print_sample_posts(
@@ -458,45 +472,12 @@ class MastodonChineseScraper:
         day_lookup: Dict[str, DayWindow],
     ) -> None:
         """Persist per-day JSON files and update the summary CSV."""
-        summary_rows: List[Tuple[str, int]] = []
         for day_key in sorted(day_lookup.keys()):
             posts = daily_posts.get(day_key, [])
-            filename = self._build_daily_filename(day_key, len(posts))
-            path = os.path.join(self.output_dir, filename)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(posts, f, ensure_ascii=False, indent=2)
-            print(f"{day_key} 共收集到 {len(posts)} 条数据，写入 {path}")
-            summary_rows.append((day_key, len(posts)))
-
-        self._append_daily_summary(summary_rows)
-
-    def _append_daily_summary(self, rows: List[Tuple[str, int]]) -> None:
-        """Create or update the aggregated daily summary CSV."""
-        if not rows:
-            return
-
-        existing: Dict[str, int] = {}
-        if os.path.exists(self.summary_path):
-            with open(self.summary_path, "r", encoding="utf-8", newline="") as csvfile:
-                reader = csv.DictReader(csvfile)
-                for entry in reader:
-                    date_key = entry.get("date")
-                    count_val = entry.get("count")
-                    if not date_key:
-                        continue
-                    try:
-                        existing[date_key] = int(count_val) if count_val is not None else 0
-                    except ValueError:
-                        existing[date_key] = 0
-
-        for day_key, count in rows:
-            existing[day_key] = count
-
-        with open(self.summary_path, "w", encoding="utf-8", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(["date", "count"])
-            for day_key in sorted(existing.keys()):
-                writer.writerow([day_key, existing[day_key]])
+            self._persist_day_posts(day_key, posts)
+            path = self._day_file_paths.get(day_key)
+            if path:
+                print(f"{day_key} 共收集到 {len(posts)} 条数据，写入 {path}")
 
     def _build_daily_filename(self, day_key: str, count: int) -> str:
         """Return the configured storage filename for a given day."""
@@ -615,6 +596,7 @@ class MastodonChineseScraper:
         daily_posts[day_key].append(record)
         seen_ids.add(post_id)
         self._sort_day_posts(daily_posts[day_key])
+        self._persist_day_posts(day_key, daily_posts[day_key])
         return True
 
     def _sort_day_posts(self, posts: List[dict]) -> None:
@@ -662,6 +644,78 @@ class MastodonChineseScraper:
             return dt.astimezone(timezone.utc)
         except ValueError:
             return None
+
+    def _persist_day_posts(self, day_key: str, posts: List[dict]) -> None:
+        """Write the day's posts to disk immediately and update summary stats."""
+        filename = self._build_daily_filename(day_key, len(posts))
+        path = os.path.join(self.output_dir, filename)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(posts, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+
+        previous_path = self._day_file_paths.get(day_key)
+        if previous_path and previous_path != path:
+            try:
+                os.remove(previous_path)
+            except OSError:
+                pass
+        self._day_file_paths[day_key] = path
+        self._update_summary_entry(day_key, len(posts))
+
+    def _load_existing_day_data(self, day_key: str) -> Tuple[List[dict], Optional[str]]:
+        """Load previously saved posts for a given day if available."""
+        date_str = day_key.replace("-", "")
+        prefix = f"{date_str}_{self.instance_slug}_("
+        pattern = os.path.join(self.output_dir, f"{prefix}*.json")
+        matches = glob.glob(pattern)
+        if not matches:
+            return [], None
+
+        path = max(matches, key=os.path.getmtime)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, list):
+                return payload, path
+        except (OSError, json.JSONDecodeError):
+            pass
+        return [], None
+
+    def _load_summary_cache(self) -> Dict[str, int]:
+        """Load existing summary counts if the CSV already exists."""
+        cache: Dict[str, int] = {}
+        if not os.path.exists(self.summary_path):
+            return cache
+
+        with open(self.summary_path, "r", encoding="utf-8", newline="") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for entry in reader:
+                date_key = entry.get("date")
+                count_val = entry.get("count")
+                if not date_key:
+                    continue
+                try:
+                    cache[date_key] = int(count_val) if count_val is not None else 0
+                except ValueError:
+                    cache[date_key] = 0
+        return cache
+
+    def _update_summary_entry(self, day_key: str, count: int) -> None:
+        """Update the in-memory summary cache and persist it."""
+        existing = self._summary_cache.get(day_key)
+        if existing == count:
+            return
+        self._summary_cache[day_key] = count
+        self._write_summary_cache()
+
+    def _write_summary_cache(self) -> None:
+        """Write the summary cache to CSV."""
+        with open(self.summary_path, "w", encoding="utf-8", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["date", "count"])
+            for day_key in sorted(self._summary_cache.keys()):
+                writer.writerow([day_key, self._summary_cache[day_key]])
 
 
 def print_usage_instructions() -> None:
