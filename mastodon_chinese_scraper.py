@@ -25,7 +25,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Pattern
 from urllib.parse import urlparse
 
 import requests
@@ -79,9 +79,23 @@ WAIT_FOR_DAY_COMPLETION = True
 LIVE_POLL_INTERVAL_SECONDS = 60
 
 
-CHINESE_PATTERN = re.compile(
-    r"[\u4e00-\u9fa5\u814a-\u9fff\u3105-\u312f\u3400-\u4dbf]"
-)
+def _build_chinese_pattern() -> Pattern[str]:
+    """
+    Precompile a regex that matches Chinese ideographs as well as common
+    Bopomofo ranges. Keeping the literal in one place (with ASCII punctuation)
+    avoids editors auto-replacing parentheses or commas with full-width variants,
+    which previously surfaced as SyntaxError reports on Windows.
+    """
+    ranges = [
+        r"\u4e00-\u9fff",  # CJK Unified Ideographs
+        r"\u814a-\u9fff",  # Additional CJK characters occasionally used online
+        r"\u3105-\u312f",  # Bopomofo
+        r"\u3400-\u4dbf",  # CJK Unified Ideographs Extension A
+    ]
+    return re.compile("[" + "".join(ranges) + "]")
+
+
+CHINESE_PATTERN = _build_chinese_pattern()
 
 
 @dataclass(frozen=True)
